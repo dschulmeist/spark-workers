@@ -1,0 +1,27 @@
+[project]
+name = "spark-workers"
+version = "0.1.0"
+description = "Shared MCP scheduler for isolated OpenCode workers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["mcp>=1.20,<2", "httpx>=0.28,<1", "uvicorn>=0.30,<1", "pydantic>=2.11,<3", "starlette>=0.40,<2"]
+
+[dependency-groups]
+dev = ["ruff>=0.14,<1"]
+
+[project.scripts]
+spark-workers = "spark_workers.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["spark_workers"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]

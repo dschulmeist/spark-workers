@@ -1,0 +1,23 @@
+{
+  "port": 18990,
+  "poll_seconds": 5,
+  "health_failure_threshold": 2,
+  "task_timeout_seconds": 1200,
+  "max_assistant_turns": 24,
+  "backends": {
+    "primary": {
+      "base_url": "http://127.0.0.1:18000/v1",
+      "provider": "primary",
+      "model": "qwen-model",
+      "capacity": 2,
+      "expand_when_unavailable": "secondary",
+      "offline_capacity": 3
+    },
+    "secondary": {
+      "base_url": "http://127.0.0.1:18889/v1",
+      "provider": "secondary",
+      "model": "glm-model",
+      "capacity": 3
+    }
+  }
+}

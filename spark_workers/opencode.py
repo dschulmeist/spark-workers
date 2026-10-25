@@ -1,0 +1,65 @@
+import json
+from pathlib import Path
+
+import httpx
+
+
+class OpenCode:
+    def __init__(self, client):
+        self.client = client
+        self.state_path = Path.home() / ".local/state/opencode/service.json"
+
+    async def request(self, method, path, body=None, params=None):
+        state = json.loads(self.state_path.read_text())
+        response = await self.client.request(
+            method,
+            state["url"] + path,
+            json=body,
+            params=params,
+            auth=httpx.BasicAuth("opencode", state["password"]),
+            timeout=20,
+        )
+        response.raise_for_status()
+        return response.json() if response.content else None
+
+    async def create(self, directory, model, permissions, title, session_id):
+        response = await self.request(
+            "POST",
+            "/api/session",
+            {
+                "id": session_id,
+                "title": title,
+                "agent": "build",
+                "model": model,
+                "location": {"directory": str(directory)},
+                "permissions": permissions,
+            },
+        )
+        return response["data"]
+
+    async def prompt(self, session, text):
+        return await self.request("POST", f"/api/session/{session}/prompt", {"text": text})
+
+    async def interrupt(self, session):
+        return await self.request("POST", f"/api/session/{session}/interrupt", {})
+
+    async def info(self, session):
+        return (await self.request("GET", f"/api/session/{session}"))["data"]
+
+    async def messages(self, session):
+        response = await self.request(
+            "GET", f"/api/session/{session}/message", params={"limit": "200", "order": "asc"}
+        )
+        return response["data"]
+
+    async def permissions(self, session):
+        return (await self.request("GET", f"/api/session/{session}/permission"))["data"]
+
+    async def permission_reply(self, session, request, approve):
+        return await self.request(
+            "POST",
+            f"/api/session/{session}/permission/{request}/reply",
+            {
+                "decision": "once" if approve else "reject",
+            },
+        )
