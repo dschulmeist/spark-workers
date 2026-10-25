@@ -109,13 +109,18 @@ async def main():
                             )
                         if job["status"] in ["completed", "failed", "cancelled"]:
                             break
-                        await asyncio.sleep(3)
+                        await session.call_tool("worker_wait", {"task_ids": [task_id], "timeout_seconds": 3})
                     assert job["status"] == "completed", job
-                    worktree = Path(job["workspace"]["worktree"])
-                    process = await asyncio.create_subprocess_exec(
-                        sys.executable, "-B", "-m", "unittest", "-v", cwd=worktree
+                    verification = await session.call_tool(
+                        "worker_verify",
+                        {
+                            "task_id": task_id,
+                            "request_id": "smoke-check",
+                            "checks": [{"argv": [sys.executable, "-B", "-m", "unittest", "-v"]}],
+                        },
                     )
-                    assert await process.wait() == 0
+                    assert not verification.isError, verification
+                    assert json.loads(verification.content[0].text)["status"] == "passed"
                     assert (repo / "calculator.py").read_text() == "def double(value):\n    return value\n"
                     git(repo, "apply", "--check", job["artifacts"]["patch"])
                     assert job["artifacts"]["changed_files"] == ["calculator.py"]

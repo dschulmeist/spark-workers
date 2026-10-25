@@ -67,6 +67,33 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VerificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uncertain_verification_blocks_lifecycle_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            async with httpx.AsyncClient() as client:
+                original = Manager(root, {"backends": {}}, client)
+                original.save(
+                    {
+                        "id": "abc",
+                        "request_id": "task",
+                        "status": "completed",
+                        "session_id": None,
+                        "verification": {
+                            "status": "running",
+                            "request_id": "interrupted",
+                            "specifications": [],
+                        },
+                    }
+                )
+                original.db.close()
+                recovered = Manager(root, {"backends": {}}, client)
+                with self.assertRaisesRegex(ValueError, "uncertain"):
+                    await recovered.verify("abc", "new-check", [{"argv": [sys.executable, "-c", "pass"]}])
+                with self.assertRaisesRegex(ValueError, "uncertain"):
+                    await recovered.followup("abc", "next", "Check another detail")
+                with self.assertRaisesRegex(ValueError, "uncertain"):
+                    await recovered.cleanup("abc")
+                recovered.db.close()
+
     async def test_false_model_claim_is_rejected_and_check_retry_is_cached(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -83,7 +110,9 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
                 artifact = manager.state / "jobs" / ("a" * 32)
                 artifact.mkdir(parents=True)
                 baseline = workspace.git(repo, "rev-parse", "HEAD").decode().strip()
-                copied = workspace.prepare(repo, baseline, True, artifact / "worktree", artifact)
+                copied = await asyncio.to_thread(
+                    workspace.prepare, repo, baseline, True, artifact / "worktree", artifact
+                )
                 job = {
                     "id": "a" * 32,
                     "request_id": "task",
