@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from .manager import Assignment, Manager
+from .verification import Check
 
 LOG = logging.getLogger(__name__)
 
@@ -117,6 +118,23 @@ def tools():
             ),
         ),
         Tool(
+            name="worker_verify",
+            description="Independently execute coordinator-approved checks in a completed task's worktree, without a model or shell. Maximum three checks and 30 seconds total; use the main agent for longer checks. Commands are trusted, not sandboxed.",
+            inputSchema=schema(
+                {
+                    "task_id": TASK_ID,
+                    "request_id": {"type": "string", "minLength": 1, "maxLength": 100},
+                    "checks": {
+                        "type": "array",
+                        "items": Check.model_json_schema(),
+                        "minItems": 1,
+                        "maxItems": 3,
+                    },
+                },
+                ["task_id", "request_id", "checks"],
+            ),
+        ),
+        Tool(
             name="worker_feedback",
             description="Record integration verdict, rework and optional measured coordinator tokens. Never invent token savings; unknown usage stays null.",
             inputSchema=schema(
@@ -208,6 +226,8 @@ def build_app(root, config):
                 arguments.get("cloud_output_tokens"),
                 arguments.get("notes", ""),
             )
+        elif name == "worker_verify":
+            result = await manager.verify(arguments["task_id"], arguments["request_id"], arguments["checks"])
         elif name == "worker_cleanup":
             result = await manager.cleanup(arguments["task_id"])
         elif name == "workers_metrics":

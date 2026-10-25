@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import workspace
 from .opencode import OpenCode
+from .verification import Check, run_check
 
 LOG = logging.getLogger(__name__)
 ACTIVE = {"preparing", "running", "waiting_permission", "cancelling", "recovering"}
@@ -408,6 +409,8 @@ class Manager:
                 return self.public(job)
             if job["status"] != "completed" or job.get("cleaned_up"):
                 raise ValueError("Follow-up requires a completed task with a retained worktree")
+            if job.get("verification", {}).get("status") == "running":
+                raise ValueError("Verification is still running or its completion is uncertain")
             if not await self.health[job["backend"]].probe(
                 self.client, self.config["health_failure_threshold"]
             ):
@@ -419,6 +422,7 @@ class Manager:
             job.setdefault("followups", []).append({"request_id": request_id, "instruction": instruction})
             job.pop("finished_at", None)
             job.pop("feedback", None)
+            job.pop("verification", None)
             self.save(job)
             await self.opencode.prompt(
                 job["session_id"],
@@ -426,10 +430,84 @@ class Manager:
             )
         return self.public(job)
 
+    async def verify(self, task_id, request_id, checks):
+        parsed = [Check.model_validate(check) for check in checks]
+        specifications = [check.model_dump() for check in parsed]
+        async with self.lock:
+            job = self.get(task_id)
+            if job["status"] != "completed" or job.get("cleaned_up"):
+                raise ValueError("Verification requires a completed task with a retained worktree")
+            previous = job.get("verification", {})
+            if previous.get("request_id") == request_id:
+                if previous["specifications"] != specifications:
+                    raise ValueError("request_id already belongs to different checks")
+                return previous
+            if previous.get("status") == "running":
+                raise ValueError("Previous verification is still running or its completion is uncertain")
+            directory = Path(job["workspace"]["worktree"])
+            logs = directory.parent / "checks" / uuid.uuid4().hex
+            logs.mkdir(parents=True)
+            report = {
+                "request_id": request_id,
+                "specifications": specifications,
+                "status": "running",
+                "checks": [],
+                "log_directory": str(logs),
+            }
+            job["verification"] = report
+            job.pop("feedback", None)
+            self.save(job)
+            deadline = time.monotonic() + 30
+            try:
+                for index, check in enumerate(parsed):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        report["checks"].append(
+                            {
+                                "argv": check.argv,
+                                "exit_code": None,
+                                "timed_out": True,
+                                "error": "Verification budget exhausted",
+                            }
+                        )
+                        break
+                    report["checks"].append(
+                        await run_check(
+                            check, directory, logs / f"{index}.log", min(remaining, check.timeout_seconds)
+                        )
+                    )
+                report["status"] = (
+                    "passed"
+                    if all(check["exit_code"] == 0 and not check["timed_out"] for check in report["checks"])
+                    else "failed"
+                )
+                exported = await asyncio.to_thread(workspace.export_changes, job, directory.parent)
+                if exported["result_tree"] != job["artifacts"]["result_tree"]:
+                    report["status"] = "failed"
+                    report["error"] = "Checks changed the exported source tree; review the updated patch"
+                job["artifacts"] = exported
+                if exported["scope_violations"]:
+                    job["status"] = "failed"
+                    report["status"] = "failed"
+                    report["error"] = "Checks changed files outside allowed_paths"
+            except asyncio.CancelledError:
+                report["status"] = "cancelled"
+                raise
+            except (OSError, ValueError) as error:
+                report["status"] = "failed"
+                report["error"] = str(error)
+            finally:
+                job["verification"] = report
+                self.save(job)
+            return report
+
     def feedback(self, task_id, verdict, rework_minutes, cloud_input_tokens, cloud_output_tokens, notes):
         job = self.get(task_id)
         if job["status"] not in TERMINAL:
             raise ValueError("Feedback requires a finished task")
+        verification = job.get("verification", {}).get("status")
+        if verification == "running" or (verdict == "accepted" and verification in {"failed", "cancelled"}):
+            raise ValueError("Resolve incomplete or failing verification before accepting this task")
         job["feedback"] = {
             "verdict": verdict,
             "rework_minutes": rework_minutes,
@@ -448,6 +526,8 @@ class Manager:
 
     async def _cleanup(self, task_id):
         job = self.get(task_id)
+        if job.get("verification", {}).get("status") == "running":
+            raise ValueError("Verification is still running or its completion is uncertain")
         if (
             job["status"] not in TERMINAL
             or job.get("feedback", {}).get("verdict") not in {"accepted", "rejected"}
@@ -523,6 +603,7 @@ class Manager:
             "connection_error",
             "stop_reason",
             "feedback",
+            "verification",
             "cleaned_up",
         ]
         return {key: job[key] for key in keys if key in job}
