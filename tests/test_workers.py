@@ -420,6 +420,9 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             ) as client:
                 manager = Manager(temporary, CONFIG, client)
                 manager.health["david"].available = True
+                folder = manager.state / "jobs/abc"
+                (folder / "worktree").mkdir(parents=True)
+                (folder / "changes.patch").touch()
                 manager.save(
                     {
                         "id": "abc",
@@ -427,6 +430,8 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                         "backend": "david",
                         "status": "completed",
                         "session_id": "ses_test",
+                        "workspace": {"worktree": str(folder / "worktree")},
+                        "artifacts": {"patch": str(folder / "changes.patch")},
                     }
                 )
 

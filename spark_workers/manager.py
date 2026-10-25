@@ -120,6 +120,51 @@ class Manager:
     def jobs(self):
         return [json.loads(row[0]) for row in self.db.execute("SELECT data FROM jobs ORDER BY rowid DESC")]
 
+    def list_tasks(
+        self, status=None, repository=None, created_after=None, created_before=None, limit=20, offset=0
+    ):
+        if created_after is not None and created_before is not None and created_after > created_before:
+            raise ValueError("created_after must not exceed created_before")
+        predicates, parameters = [], []
+        for expression, value in [
+            ("json_extract(data, '$.status') = ?", status),
+            ("json_extract(data, '$.repository') = ?", repository),
+            ("json_extract(data, '$.created_at') >= ?", created_after),
+            ("json_extract(data, '$.created_at') <= ?", created_before),
+        ]:
+            if value is not None:
+                predicates.append(expression)
+                parameters.append(value)
+        where = " AND ".join(predicates) or "1"
+        total = self.db.execute(f"SELECT COUNT(*) FROM jobs WHERE {where}", parameters).fetchone()[0]
+        rows = self.db.execute(
+            f"SELECT data FROM jobs WHERE {where} ORDER BY rowid DESC LIMIT ? OFFSET ?",
+            [*parameters, limit, offset],
+        )
+        tasks = []
+        for row in rows:
+            job = json.loads(row[0])
+            task = {
+                key: job[key]
+                for key in [
+                    "id",
+                    "backend",
+                    "status",
+                    "repository",
+                    "created_at",
+                    "finished_at",
+                    "run",
+                    "cleaned_up",
+                ]
+                if key in job
+            }
+            task["goal"] = job["goal"][:180]
+            if job.get("error"):
+                task["error"] = job["error"][:240]
+            tasks.append(task)
+        next_offset = offset + len(tasks)
+        return {"tasks": tasks, "total": total, "next_offset": next_offset if next_offset < total else None}
+
     def get(self, task_id):
         row = self.db.execute("SELECT data FROM jobs WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -391,8 +436,24 @@ class Manager:
                 and run_assistants[-1].get("time", {}).get("completed", 0) / 1000
                 >= job.get("submitted_at", float("inf"))
             )
-            if session not in active and not queued and (idle or failed_response or job["status"] == "cancelling"):
+            if (
+                session not in active
+                and not queued
+                and (idle or failed_response or job["status"] == "cancelling")
+            ):
                 job["summary"] = self.summary(run_assistants)
+                response_error = run_assistants[-1].get("error") if run_assistants else None
+                if response_error:
+                    job["opencode_error"] = {
+                        "type": response_error["type"][:100],
+                        "message": response_error["message"][:1200],
+                        **{
+                            key: response_error[key]
+                            for key in ["status", "retryAfterMs"]
+                            if key in response_error
+                        },
+                    }
+                    job["error"] = job["opencode_error"]["message"]
                 outcome = "cancelled" if job["status"] == "cancelling" else "completed"
                 if info.get("outcome") == "failed" or job.get("stop_reason"):
                     outcome = "failed"
@@ -402,7 +463,9 @@ class Manager:
                     or not self.summary([run_assistants[-1]])
                 ):
                     outcome = "failed"
-                    job["error"] = "Session ended without a final assistant response"
+                    job.setdefault("error", "Session ended without a final assistant response")
+                if job.get("stop_reason"):
+                    job["error"] = job["stop_reason"]
                 await self.finalize(job, outcome)
             else:
                 requests = await self.opencode.permissions(session)
@@ -473,20 +536,69 @@ class Manager:
         await self.opencode.permission_reply(job["session_id"], request_id, approve)
         return {"task_id": task_id, "approved_once": approve}
 
-    async def followup(self, task_id, request_id, instruction):
+    def retained_worktree(self, job):
+        copied = job.get("workspace", {})
+        if not copied.get("worktree") or not job.get("artifacts"):
+            raise ValueError("Task has no retained worktree and exported patch")
+        directory = Path(copied["worktree"])
+        expected = self.state / "jobs" / job["id"] / "worktree"
+        if directory.resolve() != expected.resolve():
+            raise ValueError("Worktree ownership check failed")
+        if not directory.is_dir() or not Path(job["artifacts"]["patch"]).is_file():
+            raise ValueError("Retained worktree or exported patch is missing")
+        return directory
+
+    async def confirm_stopped(self, job):
+        if job.get("dispatch", {}).get("status") in {"pending", "uncertain"}:
+            raise ValueError("Prompt admission is still uncertain")
+        if session := job.get("session_id"):
+            active = (await self.opencode.request("GET", "/api/session/active"))["data"]
+            inbox = await self.opencode.inbox(session)
+            if session in active or inbox:
+                raise ValueError("Session still has active execution or queued input")
+
+    async def followup(self, task_id, request_id, instruction, recovery_reason=None):
         async with self.lock:
             job = await self.refresh(task_id)
             previous = next(
                 (item for item in job.get("followups", []) if item["request_id"] == request_id), None
             )
             if previous:
-                if previous["instruction"] != instruction:
+                if (
+                    previous["instruction"] != instruction
+                    or previous.get("recovery_reason") != recovery_reason
+                ):
                     raise ValueError("request_id already belongs to a different follow-up")
                 return self.public(job)
-            if job["status"] != "completed" or job.get("cleaned_up"):
-                raise ValueError("Follow-up requires a completed task with a retained worktree")
+            if job["status"] not in {"completed", "failed"} or job.get("cleaned_up"):
+                raise ValueError("Follow-up requires a completed or failed task with a retained worktree")
             if job.get("verification", {}).get("status") == "running":
                 raise ValueError("Verification is still running or its completion is uncertain")
+            self.retained_worktree(job)
+            if job["status"] == "failed":
+                if not recovery_reason or not recovery_reason.strip():
+                    raise ValueError("Failed tasks require recovery_reason explaining the addressed cause")
+                if not job.get("session_id") or job.get("session_confirmed") is False:
+                    raise ValueError("Failed task has no confirmed session; start a new task")
+                if job.get("dispatch", {}).get("status") != "accepted":
+                    raise ValueError("Failed task has no confirmed prompt admission; start a new task")
+                await self.confirm_stopped(job)
+                if time.time() - job["created_at"] >= self.config["task_timeout_seconds"]:
+                    raise ValueError("Original task time limit is exhausted; start a new task")
+                assistants = [
+                    message
+                    for message in await self.opencode.messages(job["session_id"])
+                    if message.get("type") == "assistant"
+                ]
+                if len(assistants) >= self.config["max_assistant_turns"]:
+                    raise ValueError("Original task turn limit is exhausted; start a new task")
+                backend = self.config["backends"][job["backend"]]
+                if any(
+                    message.get("model", {}).get("providerID") != backend["provider"]
+                    or message.get("model", {}).get("id") != backend["model"]
+                    for message in assistants
+                ):
+                    raise ValueError("Session used an unexpected model; start a new task")
             if not await self.health[job["backend"]].probe(
                 self.client, self.config["health_failure_threshold"]
             ):
@@ -497,7 +609,9 @@ class Manager:
             job["run"] = job.get("run", 1) + 1
             job["status"] = "running"
             job["submitted_at"] = time.time()
-            job.setdefault("followups", []).append({"request_id": request_id, "instruction": instruction})
+            job.setdefault("followups", []).append(
+                {"request_id": request_id, "instruction": instruction, "recovery_reason": recovery_reason}
+            )
             job.pop("finished_at", None)
             job.pop("feedback", None)
             job.pop("verification", None)
@@ -507,6 +621,7 @@ class Manager:
                 "duration_seconds",
                 "permission_requests",
                 "error",
+                "opencode_error",
                 "connection_error",
                 "stop_reason",
             ]:
@@ -514,7 +629,9 @@ class Manager:
             self.save(job)
             await self.send_prompt(
                 task_id,
-                "Follow-up within the original allowed_paths and assignment constraints:\n" + instruction,
+                "Follow-up within the original allowed_paths and assignment constraints:\n"
+                + instruction
+                + ("\nRecovery reason: " + recovery_reason if recovery_reason else ""),
             )
         return self.public(self.get(task_id))
 
@@ -523,8 +640,8 @@ class Manager:
         specifications = [check.model_dump() for check in parsed]
         async with self.lock:
             job = self.get(task_id)
-            if job["status"] != "completed" or job.get("cleaned_up"):
-                raise ValueError("Verification requires a completed task with a retained worktree")
+            if job["status"] not in {"completed", "failed"} or job.get("cleaned_up"):
+                raise ValueError("Verification requires a completed or failed task with a retained worktree")
             previous = job.get("verification", {})
             if previous.get("request_id") == request_id:
                 if previous["specifications"] != specifications:
@@ -532,7 +649,9 @@ class Manager:
                 return previous
             if previous.get("status") == "running":
                 raise ValueError("Previous verification is still running or its completion is uncertain")
-            directory = Path(job["workspace"]["worktree"])
+            directory = self.retained_worktree(job)
+            if job["status"] == "failed":
+                await self.confirm_stopped(job)
             logs = directory.parent / "checks" / uuid.uuid4().hex
             logs.mkdir(parents=True)
             report = {
@@ -686,6 +805,7 @@ class Manager:
             "tokens",
             "permission_requests",
             "error",
+            "opencode_error",
             "connection_error",
             "stop_reason",
             "feedback",

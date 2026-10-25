@@ -16,7 +16,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .manager import Assignment, Manager
+from .manager import ACTIVE, TERMINAL, Assignment, Manager
 from .verification import Check
 
 LOG = logging.getLogger(__name__)
@@ -68,6 +68,21 @@ def tools():
             annotations=read_only,
         ),
         Tool(
+            name="workers_list",
+            description="Find stored tasks, newest first. Filter by status, exact repository path, or inclusive creation-time bounds in Unix seconds. Returns compact results with total count and next_offset; use worker_result for details.",
+            inputSchema=schema(
+                {
+                    "status": {"type": "string", "enum": sorted(ACTIVE | TERMINAL)},
+                    "repository": {"type": "string", "minLength": 1},
+                    "created_after": {"type": "number", "minimum": 0},
+                    "created_before": {"type": "number", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                }
+            ),
+            annotations=read_only,
+        ),
+        Tool(
             name="worker_result",
             description="Get current progress or a recorded historical run: summary, verification and patch paths. Token usage is session-cumulative at that run. Full logs stay local.",
             inputSchema=schema({"task_id": TASK_ID, "run": {"type": "integer", "minimum": 1}}, ["task_id"]),
@@ -107,19 +122,20 @@ def tools():
         ),
         Tool(
             name="worker_followup",
-            description="Resume a completed worker in its original worktree with bounded corrections. Original scope and time budget still apply.",
+            description="Resume a completed worker, or a stopped failed worker with an explicit recovery_reason explaining the addressed cause. Original worktree, edit scope, model, capacity and total budgets still apply. Does not override denied permissions.",
             inputSchema=schema(
                 {
                     "task_id": TASK_ID,
                     "request_id": {"type": "string", "minLength": 1, "maxLength": 100},
                     "instruction": {"type": "string", "minLength": 5, "maxLength": 12000},
+                    "recovery_reason": {"type": "string", "minLength": 5, "maxLength": 2000},
                 },
                 ["task_id", "request_id", "instruction"],
             ),
         ),
         Tool(
             name="worker_verify",
-            description="Independently execute coordinator-approved checks in a completed task's worktree, without a model or shell. Maximum three checks and 30 seconds total; use the main agent for longer checks. Commands are trusted, not sandboxed.",
+            description="Independently check retained patches from completed or stopped failed tasks, without a model or shell. Passing checks do not change a failed run's status. Maximum three checks and 30 seconds total. Commands are trusted, not sandboxed.",
             inputSchema=schema(
                 {
                     "task_id": TASK_ID,
@@ -203,6 +219,8 @@ def build_app(root, config):
                     for j in manager.jobs()[:10]
                 ],
             }
+        elif name == "workers_list":
+            result = manager.list_tasks(**arguments)
         elif name == "worker_result":
             result = await manager.result(arguments["task_id"], arguments.get("run"))
         elif name == "worker_wait":
@@ -215,7 +233,10 @@ def build_app(root, config):
             result = await manager.reply(arguments["task_id"], arguments["request_id"], arguments["approve"])
         elif name == "worker_followup":
             result = await manager.followup(
-                arguments["task_id"], arguments["request_id"], arguments["instruction"]
+                arguments["task_id"],
+                arguments["request_id"],
+                arguments["instruction"],
+                arguments.get("recovery_reason"),
             )
         elif name == "worker_feedback":
             result = manager.feedback(

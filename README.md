@@ -36,6 +36,8 @@ Reconnect clients after installation. The skill requests active delegation of su
 
 Start with an explicit base commit, goal, relevant files, allowed edit paths and acceptance criteria. Reuse the same request ID when retrying a start or follow-up. `worker_wait` waits for any/all selected tasks within a whole-call deadline and returns early for approvals. `worker_result` returns details; its optional `run` selects an archived result. Previous summaries, patches and evidence survive follow-ups. Patches are cumulative from the task input, and usage is session-cumulative, not a per-run delta.
 
+`workers_list` finds stored tasks by status, exact repository path, and inclusive creation-time bounds (`created_after` / `created_before`, Unix seconds). Results are newest first, default to 20 (maximum 100), and include `next_offset` for pagination. `worker_result` includes a bounded `opencode_error` with the original error type and message; full response bodies stay in local evidence.
+
 `worker_cancel` retains its slot until execution is confirmed stopped and queued input is removed. Uncertain prompt admission also retains the slot, including across restarts, until the recorded message ID is found in OpenCode. Shell permissions are granted once by the coordinator; recursive delegation is denied.
 
 With `include_working_tree=true`, the base must equal current HEAD. A temporary Git index snapshots tracked and non-ignored untracked files without changing the caller's index. Ignored dependencies/data are not copied; submodules are rejected. Worktrees isolate files, not networks or services. Approved shell commands are not sandboxed.
@@ -43,6 +45,8 @@ With `include_working_tree=true`, the base must equal current HEAD. A temporary 
 Inspect patches and integrate them serially; completion is not independent test verification or acceptance. Record review/rework with `worker_feedback`, then call `worker_cleanup` after preserving accepted changes or rejecting the result. Cleanup refuses edits made after export. Tasks survive scheduler restarts without resending prompts. Full evidence stays in `.state/jobs/<task-id>/`; logs rotate in `.state/service.log`.
 
 `worker_verify` independently runs up to three coordinator-approved command argument lists without a shell or model. Commands share a 30-second execution budget; timeouts terminate their process group. Output previews and retained logs are capped. Checks are serialized with lifecycle changes; run longer tests through the main agent. Failed checks block acceptance. If the service is killed during a check, its running marker blocks continuation/cleanup until an operator reconciles the retained logs and process. Commands are trusted, not sandboxed.
+
+Retained patches from stopped `failed` tasks can also be verified; passing checks do not rewrite the failed outcome. To correct a fixable failure, call `worker_followup` with an explicit `recovery_reason`. The previous failure and patch are archived. Original edit permissions, model and total budgets remain in force; uncertain execution or exhausted budgets require reconciliation or a new task. Recovery does not override a denied command.
 
 `workers_metrics` reports runtime, worker usage and review outcomes. Coordinator token counts require explicit measured input. Missing usage remains unknown, and no token-saving percentage is inferred.
 

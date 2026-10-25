@@ -101,10 +101,38 @@ class DenialTests(unittest.IsolatedAsyncioTestCase):
         result = await self.manager.refresh("task")
         self.api.permission_reply.assert_awaited_once_with("session", "permission", False)
         self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "Step interrupted")
+        self.assertEqual(result["opencode_error"], {"type": "aborted", "message": "Step interrupted"})
         self.assertEqual(self.manager.status()["test"]["free"], 1)
         self.assertEqual(result["artifacts"]["changed_files"], ["code.py"])
         self.assertIn("+value = 2", Path(result["artifacts"]["patch"]).read_text())
         self.api.prompt.assert_not_awaited()
+
+    async def test_failed_session_preserves_specific_error(self):
+        self.api.info.return_value["outcome"] = "failed"
+        self.error_response["error"] = {"type": "api", "message": "Model server unavailable", "status": 503}
+        result = await self.manager.result("task")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "Model server unavailable")
+        self.assertEqual(result["opencode_error"]["status"], 503)
+
+    async def test_error_preview_is_bounded_and_excludes_response_body(self):
+        self.error_response["error"] = {
+            "type": "api",
+            "message": "x" * 5000,
+            "response": {"body": "large response body"},
+        }
+        result = await self.manager.result("task")
+        self.assertEqual(len(result["error"]), 1200)
+        self.assertEqual(len(result["opencode_error"]["message"]), 1200)
+        self.assertNotIn("response", result["opencode_error"])
+
+    async def test_previous_run_error_is_not_reported_as_current_failure(self):
+        self.error_response["time"]["created"] = (self.submitted - 10) * 1000
+        self.api.info.return_value["time"]["idle"] = time.time() * 1000
+        result = await self.manager.result("task")
+        self.assertEqual(result["error"], "Session ended without a final assistant response")
+        self.assertNotIn("opencode_error", result)
 
     async def test_active_session_retains_slot_after_error(self):
         self.api.request.return_value = {"data": {"session": {}}}

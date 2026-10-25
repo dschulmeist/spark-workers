@@ -2,9 +2,11 @@ import copy
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from starlette.testclient import TestClient
@@ -46,6 +48,8 @@ class ProtocolTests(unittest.TestCase):
                 "request_id": "fixture",
                 "backend": "primary",
                 "goal": "Fix the numeric value",
+                "repository": str(repo),
+                "created_at": 1000,
                 "status": "completed",
                 "session_id": None,
                 "workspace": copied,
@@ -92,6 +96,31 @@ class ProtocolTests(unittest.TestCase):
                     waited = call("worker_wait", {"task_ids": [task_id], "timeout_seconds": 0})
                     self.assertTrue(waited["ready"])
                     self.assertNotIn("summary", waited["tasks"][0])
+                    listed = call(
+                        "workers_list",
+                        {
+                            "status": "completed",
+                            "repository": str(repo),
+                            "created_after": 1000,
+                            "created_before": 1000,
+                            "limit": 1,
+                        },
+                    )
+                    self.assertEqual(listed["total"], 1)
+                    self.assertEqual(listed["tasks"][0]["id"], task_id)
+                    self.assertIsNone(listed["next_offset"])
+                    self.assertNotIn("summary", listed["tasks"][0])
+                    for invalid in [{"limit": 0}, {"limit": 101}, {"offset": -1}, {"status": "unknown"}]:
+                        response = client.post(
+                            "/mcp",
+                            json={
+                                "jsonrpc": "2.0",
+                                "id": 3,
+                                "method": "tools/call",
+                                "params": {"name": "workers_list", "arguments": invalid},
+                            },
+                        ).json()["result"]
+                        self.assertTrue(response["isError"], response)
                     checked = call(
                         "worker_verify",
                         {
@@ -116,6 +145,94 @@ class ProtocolTests(unittest.TestCase):
                     self.assertTrue(call("worker_cleanup", {"task_id": task_id})["cleaned_up"])
                     self.assertFalse(Path(copied["worktree"]).exists())
                     self.assertEqual((repo / "code.py").read_text(), "value = 1\n")
+
+    def test_failed_followup_requires_and_forwards_recovery_reason_over_mcp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task_id = "b" * 32
+            model_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, json={"data": [{"id": "qwen-model"}]})
+                )
+            )
+            seed = Manager(root, copy.deepcopy(CONFIG), model_client)
+            folder = seed.state / "jobs" / task_id
+            (folder / "worktree").mkdir(parents=True)
+            (folder / "changes.patch").touch()
+            seed.save(
+                {
+                    "id": task_id,
+                    "request_id": "fixture",
+                    "backend": "primary",
+                    "goal": "Review retained changes",
+                    "status": "failed",
+                    "error": "Step interrupted",
+                    "session_id": "session",
+                    "session_confirmed": True,
+                    "dispatch": {"id": "msg_initial", "status": "accepted"},
+                    "created_at": time.time(),
+                    "workspace": {"worktree": str(folder / "worktree")},
+                    "artifacts": {"patch": str(folder / "changes.patch")},
+                    "allowed_paths": ["code.py"],
+                }
+            )
+            seed.db.close()
+            api = SimpleNamespace(
+                info=AsyncMock(return_value={"time": {}}),
+                request=AsyncMock(return_value={"data": {}}),
+                inbox=AsyncMock(return_value=[]),
+                messages=AsyncMock(return_value=[]),
+                permissions=AsyncMock(return_value=[]),
+                prompt=AsyncMock(),
+            )
+            with (
+                patch("spark_workers.server.httpx.AsyncClient", return_value=model_client),
+                patch("spark_workers.manager.OpenCode", return_value=api),
+                TestClient(
+                    build_app(root, copy.deepcopy(CONFIG)), base_url="http://127.0.0.1:18990"
+                ) as client,
+            ):
+                client.headers["Accept"] = "application/json, text/event-stream"
+                initialized = client.post(
+                    "/mcp",
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {},
+                            "clientInfo": {"name": "test", "version": "1"},
+                        },
+                    },
+                )
+                client.headers["Mcp-Session-Id"] = initialized.headers["Mcp-Session-Id"]
+                client.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+                arguments = {
+                    "task_id": task_id,
+                    "request_id": "fix",
+                    "instruction": "Review retained changes",
+                }
+                for reason in [None, "Use a read-only check instead of the rejected shell command"]:
+                    if reason:
+                        arguments["recovery_reason"] = reason
+                    response = client.post(
+                        "/mcp",
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {"name": "worker_followup", "arguments": arguments},
+                        },
+                    ).json()["result"]
+                    if reason is None:
+                        self.assertTrue(response["isError"], response)
+                        api.prompt.assert_not_awaited()
+                    else:
+                        self.assertFalse(response.get("isError"), response)
+                        self.assertEqual(json.loads(response["content"][0]["text"])["run"], 2)
+                        self.assertIn(reason, api.prompt.call_args.args[1])
+                api.prompt.assert_awaited_once()
 
     def test_mcp_discovery_status_and_offline_start(self):
         def model_server(request):

@@ -24,6 +24,7 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
                 manager = Manager(root, CONFIG, client)
                 folder = manager.state / "jobs/abc"
                 folder.mkdir(parents=True)
+                (folder / "worktree").mkdir()
                 patch = folder / "changes.patch"
                 patch.write_text("first patch")
                 (folder / "opencode.json").write_text("first evidence")
@@ -37,6 +38,7 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
                         "session_id": "ses_test",
                         "summary": "first result",
                         "artifacts": {"patch": str(patch)},
+                        "workspace": {"worktree": str(folder / "worktree")},
                         "tokens": {"input": 100},
                     }
                 )
