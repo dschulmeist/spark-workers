@@ -9,7 +9,7 @@ from spark_workers.manager import Manager
 
 
 class WaitTests(unittest.IsolatedAsyncioTestCase):
-    async def test_wait_deadline_includes_slow_refresh(self):
+    async def test_wait_uses_monitored_state_and_stays_within_deadline(self):
         with tempfile.TemporaryDirectory() as root:
             async with httpx.AsyncClient() as client:
                 manager = Manager(root, {"backends": {}}, client)
@@ -30,10 +30,10 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
                 started = asyncio.Event()
                 manager.refresh = refresh
                 before = time.monotonic()
-                result = await manager.wait(["one"], "all", 1.02)
+                result = await manager.wait(["one"], "all", 0.02)
                 self.assertTrue(result["timed_out"])
-                self.assertTrue(started.is_set())
-                self.assertLess(time.monotonic() - before, 1.5)
+                self.assertFalse(started.is_set())
+                self.assertLess(time.monotonic() - before, 0.5)
                 manager.db.close()
 
     async def test_any_all_timeout_and_permission(self):

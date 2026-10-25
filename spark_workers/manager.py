@@ -302,12 +302,8 @@ class Manager:
                         for job in jobs
                     ],
                 }
-            try:
-                async with asyncio.timeout(remaining):
-                    await asyncio.sleep(min(1, remaining))
-                    jobs = await asyncio.gather(*(self.refresh(task_id) for task_id in task_ids))
-            except TimeoutError:
-                jobs = [self.get(task_id) for task_id in task_ids]
+            await asyncio.sleep(min(1, remaining))
+            jobs = [self.get(task_id) for task_id in task_ids]
 
     async def _refresh(self, task_id):
         job = self.get(task_id)
