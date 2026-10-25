@@ -384,7 +384,14 @@ class Manager:
                 job["status"] = "cancelling"
             idle = info.get("time", {}).get("idle", 0) / 1000 >= job.get("submitted_at", float("inf"))
             queued = dispatch and any(item.get("id") == dispatch["id"] for item in inbox)
-            if session not in active and not queued and (idle or job["status"] == "cancelling"):
+            failed_response = bool(
+                run_assistants
+                and run_assistants[-1].get("finish") == "error"
+                and run_assistants[-1].get("error")
+                and run_assistants[-1].get("time", {}).get("completed", 0) / 1000
+                >= job.get("submitted_at", float("inf"))
+            )
+            if session not in active and not queued and (idle or failed_response or job["status"] == "cancelling"):
                 job["summary"] = self.summary(run_assistants)
                 outcome = "cancelled" if job["status"] == "cancelling" else "completed"
                 if info.get("outcome") == "failed" or job.get("stop_reason"):
