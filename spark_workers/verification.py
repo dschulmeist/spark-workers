@@ -45,11 +45,10 @@ async def run_check(check, directory, log_path, timeout_seconds):
     except TimeoutError:
         result["timed_out"] = True
     finally:
-        if process.returncode is None or not reader.done():
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         await process.wait()
         await reader
     return {

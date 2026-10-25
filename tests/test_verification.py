@@ -65,6 +65,28 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.7)
             self.assertFalse((Path(root) / "escaped").exists())
 
+    async def test_success_terminates_background_children_with_redirected_output(self):
+        with tempfile.TemporaryDirectory() as root:
+            child = (
+                "import time,pathlib; pathlib.Path('started').touch(); "
+                "time.sleep(0.6); pathlib.Path('escaped').touch()"
+            )
+            parent = (
+                "import pathlib,subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable,'-c',{child!r}], "
+                "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+                "while not pathlib.Path('started').exists(): time.sleep(0.005)\n"
+                "print('parent finished')"
+            )
+            result = await run_check(
+                Check(argv=[sys.executable, "-c", parent]), root, Path(root) / "check.log", 3
+            )
+            self.assertEqual(result["exit_code"], 0)
+            self.assertFalse(result["timed_out"])
+            self.assertTrue((Path(root) / "started").exists())
+            await asyncio.sleep(0.7)
+            self.assertFalse((Path(root) / "escaped").exists())
+
 
 class VerificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_uncertain_verification_blocks_lifecycle_after_restart(self):
