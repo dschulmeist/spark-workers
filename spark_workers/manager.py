@@ -251,6 +251,33 @@ class Manager:
         async with self.refresh_locks.setdefault(task_id, asyncio.Lock()):
             return await self._refresh(task_id)
 
+    async def wait(self, task_ids, mode, timeout_seconds):
+        deadline = time.monotonic() + timeout_seconds
+        jobs = [self.get(task_id) for task_id in task_ids]
+        while True:
+            finished = [job["status"] in TERMINAL for job in jobs]
+            ready = any(finished) if mode == "any" else all(finished)
+            remaining = deadline - time.monotonic()
+            if ready or remaining <= 0 or any(job["status"] == "waiting_permission" for job in jobs):
+                return {
+                    "ready": ready,
+                    "timed_out": not ready and remaining <= 0,
+                    "tasks": [
+                        {
+                            key: job[key]
+                            for key in ["id", "backend", "status", "permission_requests"]
+                            if key in job
+                        }
+                        for job in jobs
+                    ],
+                }
+            try:
+                async with asyncio.timeout(remaining):
+                    await asyncio.sleep(min(1, remaining))
+                    jobs = await asyncio.gather(*(self.refresh(task_id) for task_id in task_ids))
+            except TimeoutError:
+                jobs = [self.get(task_id) for task_id in task_ids]
+
     async def _refresh(self, task_id):
         job = self.get(task_id)
         session = job.get("session_id")

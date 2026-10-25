@@ -73,6 +73,25 @@ def tools():
             annotations=read_only,
         ),
         Tool(
+            name="worker_wait",
+            description="Wait up to 30 seconds for any/all selected tasks. Returns early for command approvals. Prefer this to repeated status polling when no independent work remains.",
+            inputSchema=schema(
+                {
+                    "task_ids": {
+                        "type": "array",
+                        "items": TASK_ID,
+                        "minItems": 1,
+                        "maxItems": 5,
+                        "uniqueItems": True,
+                    },
+                    "mode": {"type": "string", "enum": ["any", "all"]},
+                    "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 30},
+                },
+                ["task_ids"],
+            ),
+            annotations=read_only,
+        ),
+        Tool(
             name="worker_cancel",
             description="Interrupt one worker. Retains partial changes and logs; releases capacity only after execution stops.",
             inputSchema=schema({"task_id": TASK_ID}, ["task_id"]),
@@ -168,6 +187,10 @@ def build_app(root, config):
             }
         elif name == "worker_result":
             result = manager.public(await manager.refresh(arguments["task_id"]))
+        elif name == "worker_wait":
+            result = await manager.wait(
+                arguments["task_ids"], arguments.get("mode", "all"), arguments.get("timeout_seconds", 20)
+            )
         elif name == "worker_cancel":
             result = await manager.cancel(arguments["task_id"])
         elif name == "worker_permission":
