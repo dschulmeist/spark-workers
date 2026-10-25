@@ -169,6 +169,41 @@ class WorkspaceTests(unittest.TestCase):
 
         asyncio.run(check())
 
+    def test_cleanup_preserves_worktree_when_source_repository_is_missing(self):
+        async def check():
+            async with httpx.AsyncClient() as client:
+                manager = Manager(self.root, CONFIG, client)
+                task_id = "b" * 32
+                folder = manager.state / "jobs" / task_id
+                folder.mkdir(parents=True)
+                copied = workspace.prepare(self.repo, self.base, True, folder / "worktree", folder)
+                job = {
+                    "id": task_id,
+                    "request_id": "missing-source",
+                    "backend": "david",
+                    "status": "completed",
+                    "session_id": None,
+                    "workspace": copied,
+                    "allowed_paths": ["a.py"],
+                    "feedback": {"verdict": "accepted"},
+                }
+                job["artifacts"] = workspace.export_changes(job, folder)
+                manager.save(job)
+                valuable = Path(copied["worktree"]) / "a.py"
+                valuable.write_text("value = 999\n")
+                self.repo.rename(self.root / "moved-repo")
+                try:
+                    with self.assertRaisesRegex(ValueError, "Source repository is unavailable"):
+                        await manager.cleanup(task_id)
+                    self.assertEqual(valuable.read_text(), "value = 999\n")
+                    self.assertFalse(manager.get(task_id).get("cleaned_up", False))
+                    self.assertTrue(Path(job["artifacts"]["patch"]).exists())
+                finally:
+                    (self.root / "moved-repo").rename(self.repo)
+                    manager.db.close()
+
+        asyncio.run(check())
+
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_refresh_failure_does_not_overwrite_concurrent_cancellation(self):

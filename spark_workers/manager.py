@@ -622,18 +622,16 @@ class Manager:
         path = Path(job["workspace"]["worktree"])
         if path.resolve() != (self.state / "jobs" / task_id / "worktree").resolve():
             raise ValueError("Worktree ownership check failed")
-        if path.exists() and Path(job["workspace"]["repository"]).exists():
+        repository = Path(job["workspace"]["repository"])
+        if not repository.is_dir():
+            raise ValueError("Source repository is unavailable; restore it before cleanup")
+        if path.exists():
             current = await asyncio.to_thread(
                 workspace.tree_from_working_copy, path, job["workspace"]["snapshot_commit"], path.parent
             )
             if current != job["artifacts"]["result_tree"]:
                 raise ValueError("Worktree changed after export; preserve its new changes before cleanup")
-        if Path(job["workspace"]["repository"]).exists():
-            await asyncio.to_thread(
-                workspace.git, job["workspace"]["repository"], "worktree", "remove", "--force", str(path)
-            )
-        elif path.exists():
-            await asyncio.to_thread(shutil.rmtree, path)
+        await asyncio.to_thread(workspace.git, repository, "worktree", "remove", "--force", str(path))
         job["cleaned_up"] = True
         self.save(job)
         return {"cleaned_up": True, "retained_patch": job["artifacts"]["patch"]}
