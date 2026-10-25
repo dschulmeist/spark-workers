@@ -229,6 +229,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                                     "id": CONFIG["backends"]["david"]["model"],
                                 },
                                 "content": [{"type": "text", "text": "Checked the requested files"}],
+                                "time": {"created": time.time() * 1000},
                                 "finish": "stop",
                             }
                         ]

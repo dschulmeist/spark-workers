@@ -6,6 +6,7 @@ import sqlite3
 import time
 import uuid
 from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 
 import httpx
@@ -173,6 +174,7 @@ class Manager:
                 "id": uuid.uuid4().hex,
                 "backend": backend,
                 "status": "preparing",
+                "run": 1,
                 "created_at": time.time(),
                 "session_id": None,
             }
@@ -252,6 +254,34 @@ class Manager:
         async with self.refresh_locks.setdefault(task_id, asyncio.Lock()):
             return await self._refresh(task_id)
 
+    async def result(self, task_id, run=None):
+        job = self.get(task_id)
+        if run is None or run == job.get("run", 1):
+            return self.public(await self.refresh(task_id))
+        path = self.state / "jobs" / task_id / "runs" / str(run) / "result.json"
+        if not path.is_file():
+            raise ValueError("No recorded result for this run")
+        return json.loads(path.read_text())
+
+    def archive_run(self, job):
+        folder = self.state / "jobs" / job["id"] / "runs" / str(job.get("run", 1))
+        result_path = folder / "result.json"
+        if result_path.exists():
+            return
+        folder.mkdir(parents=True, exist_ok=True)
+        snapshot = deepcopy(self.public(job))
+        if job.get("artifacts"):
+            shutil.copyfile(job["artifacts"]["patch"], folder / "changes.patch")
+            snapshot["artifacts"]["patch"] = str(folder / "changes.patch")
+        evidence = folder.parent.parent / "opencode.json"
+        if evidence.is_file():
+            shutil.copyfile(evidence, folder / "opencode.json")
+            snapshot["evidence"] = str(folder / "opencode.json")
+        snapshot.update(historical=True, recorded_at=time.time())
+        temporary = folder / "result.json.tmp"
+        temporary.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        temporary.replace(result_path)
+
     async def wait(self, task_ids, mode, timeout_seconds):
         deadline = time.monotonic() + timeout_seconds
         jobs = [self.get(task_id) for task_id in task_ids]
@@ -294,6 +324,11 @@ class Manager:
                 json.dumps({"session": info, "messages": messages}, ensure_ascii=False, indent=2)
             )
             assistants = [m for m in messages if m.get("type") == "assistant"]
+            run_assistants = [
+                m
+                for m in assistants
+                if m.get("time", {}).get("created", 0) >= job.get("submitted_at", 0) * 1000
+            ]
             job["tokens"] = info.get("tokens")
             job["cost_reported_by_opencode"] = info.get("cost")
             expected = self.config["backends"][job["backend"]]
@@ -317,14 +352,14 @@ class Manager:
                 job["status"] = "cancelling"
             idle = info.get("time", {}).get("idle", 0) / 1000 >= job.get("submitted_at", float("inf"))
             if session not in active and (idle or job["status"] == "cancelling"):
-                job["summary"] = self.summary(assistants)
+                job["summary"] = self.summary(run_assistants)
                 outcome = "cancelled" if job["status"] == "cancelling" else "completed"
                 if info.get("outcome") == "failed" or job.get("stop_reason"):
                     outcome = "failed"
                 if outcome == "completed" and (
-                    not assistants
-                    or assistants[-1].get("finish") != "stop"
-                    or not self.summary([assistants[-1]])
+                    not run_assistants
+                    or run_assistants[-1].get("finish") != "stop"
+                    or not self.summary([run_assistants[-1]])
                 ):
                     outcome = "failed"
                     job["error"] = "Session ended without a final assistant response"
@@ -375,6 +410,7 @@ class Manager:
                 status = "failed"
                 job["error"] = f"Artifact export failed: {error}"
         job["status"] = status
+        job.pop("permission_requests", None)
         job["finished_at"] = time.time()
         job["duration_seconds"] = round(job["finished_at"] - job["created_at"], 2)
         self.save(job)
@@ -417,12 +453,24 @@ class Manager:
                 raise ValueError("Backend is not reachable")
             if not self.status()[job["backend"]]["free"]:
                 raise ValueError("Backend has no free slots")
+            self.archive_run(job)
+            job["run"] = job.get("run", 1) + 1
             job["status"] = "running"
             job["submitted_at"] = time.time()
             job.setdefault("followups", []).append({"request_id": request_id, "instruction": instruction})
             job.pop("finished_at", None)
             job.pop("feedback", None)
             job.pop("verification", None)
+            for key in [
+                "summary",
+                "artifacts",
+                "duration_seconds",
+                "permission_requests",
+                "error",
+                "connection_error",
+                "stop_reason",
+            ]:
+                job.pop(key, None)
             self.save(job)
             await self.opencode.prompt(
                 job["session_id"],
@@ -606,7 +654,12 @@ class Manager:
             "verification",
             "cleaned_up",
         ]
-        return {key: job[key] for key in keys if key in job}
+        return {
+            "run": job.get("run", 1),
+            "usage_scope": "session_cumulative",
+            "patch_scope": "task_input_snapshot",
+            **{key: job[key] for key in keys if key in job},
+        }
 
     async def recover(self):
         for job in self.jobs():

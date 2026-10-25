@@ -69,8 +69,8 @@ def tools():
         ),
         Tool(
             name="worker_result",
-            description="Get compact progress, pending permissions, final summary and patch paths. Full logs stay local.",
-            inputSchema=schema({"task_id": TASK_ID}, ["task_id"]),
+            description="Get current progress or a recorded historical run: summary, verification and patch paths. Token usage is session-cumulative at that run. Full logs stay local.",
+            inputSchema=schema({"task_id": TASK_ID, "run": {"type": "integer", "minimum": 1}}, ["task_id"]),
             annotations=read_only,
         ),
         Tool(
@@ -204,7 +204,7 @@ def build_app(root, config):
                 ],
             }
         elif name == "worker_result":
-            result = manager.public(await manager.refresh(arguments["task_id"]))
+            result = await manager.result(arguments["task_id"], arguments.get("run"))
         elif name == "worker_wait":
             result = await manager.wait(
                 arguments["task_ids"], arguments.get("mode", "all"), arguments.get("timeout_seconds", 20)
