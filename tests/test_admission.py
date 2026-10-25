@@ -58,6 +58,9 @@ class DelayedOpenCode:
     async def interrupt(self, session):
         self.executing = False
 
+    async def permissions(self, session):
+        return []
+
     async def request(self, method, path):
         return {"data": {self.session: {}} if self.executing else {}}
 
@@ -200,3 +203,36 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.api.prompts, 1)
         finally:
             recovered.db.close()
+
+    async def test_accepted_queue_retains_slot_until_removal_is_confirmed(self):
+        self.api.queued = True
+        task_id = await self.start_pending()
+        self.api.release.set()
+        await asyncio.gather(*self.manager.background)
+        await self.manager.refresh(task_id)
+        self.assertEqual(self.manager.get(task_id)["status"], "running")
+        self.assertEqual(self.manager.status()["test"]["free"], 0)
+        remove = self.api.cancel_input
+
+        async def offline(session, message_id):
+            raise httpx.ConnectError("Inbox cancellation unavailable")
+
+        self.api.cancel_input = offline
+        await self.manager.cancel(task_id)
+        await self.assert_slot_retained(task_id)
+        self.assertTrue(self.api.queued)
+        self.api.cancel_input = remove
+        await self.manager.refresh(task_id)
+        self.assertFalse(self.api.queued)
+        self.assertEqual(self.manager.get(task_id)["status"], "cancelled")
+
+    async def test_cancelled_sender_persists_uncertain_admission(self):
+        task_id = await self.start_pending()
+        pending = next(iter(self.manager.background))
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        await self.manager.refresh(task_id)
+        self.assertEqual(self.manager.get(task_id)["dispatch"]["status"], "uncertain")
+        await self.assert_slot_retained(task_id)
+        self.assertEqual(self.api.prompts, 1)
