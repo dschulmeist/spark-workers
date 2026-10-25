@@ -218,14 +218,15 @@ class Manager:
             job = self.get(task_id)
             job["session_id"] = session["id"]
             job["session_confirmed"] = True
-            if job["status"] == "cancelling":
+            if job["status"] != "preparing":
                 self.save(job)
-                await self.cancel(task_id)
+                if job["status"] == "cancelling":
+                    await self.cancel(task_id)
                 return
             job["submitted_at"] = time.time()
             job["status"] = "running"
             self.save(job)
-            await self.opencode.prompt(session["id"], assignment_prompt(job))
+            await self.send_prompt(task_id, assignment_prompt(job))
         except Exception as error:
             LOG.exception("Worker preparation failed: %s", task_id)
             job = self.get(task_id)
@@ -249,6 +250,25 @@ class Manager:
                         "snapshot_commit": workspace.git(worktree, "rev-parse", "HEAD").decode().strip(),
                     }
                 await self.finalize(job, "failed")
+
+    async def send_prompt(self, task_id, text):
+        job = self.get(task_id)
+        job["dispatch"] = {"id": "msg_" + uuid.uuid4().hex, "status": "pending"}
+        self.save(job)
+        try:
+            await self.opencode.prompt(job["session_id"], text, job["dispatch"]["id"])
+        except BaseException:
+            job = self.get(task_id)
+            job["dispatch"]["status"] = "uncertain"
+            job["status"] = "cancelling"
+            job["stop_reason"] = "Prompt admission uncertain; waiting for positive admission evidence"
+            self.save(job)
+            raise
+        job = self.get(task_id)
+        job["dispatch"]["status"] = "accepted"
+        self.save(job)
+        if job["status"] == "cancelling":
+            await self.refresh(task_id)
 
     async def refresh(self, task_id):
         async with self.refresh_locks.setdefault(task_id, asyncio.Lock()):
@@ -310,11 +330,21 @@ class Manager:
         session = job.get("session_id")
         if job["status"] not in ACTIVE or not session:
             return job
+        if job.get("dispatch", {}).get("status") == "pending":
+            return job
         try:
             info = await self.opencode.info(session)
             if job["status"] == "preparing":
                 return job
             messages = await self.opencode.messages(session)
+            dispatch = job.get("dispatch")
+            inbox = await self.opencode.inbox(session) if dispatch else []
+            if dispatch and dispatch["status"] == "uncertain":
+                if not any(item.get("id") == dispatch["id"] for item in [*inbox, *messages]):
+                    return self.get(task_id)
+                dispatch["status"] = "accepted"
+                job["status"] = self.get(task_id)["status"]
+                self.save(job)
             artifact = self.state / "jobs" / task_id
             (artifact / "opencode.json").write_text(
                 json.dumps({"session": info, "messages": messages}, ensure_ascii=False, indent=2)
@@ -338,16 +368,23 @@ class Manager:
                 job["stop_reason"] = "Worker time limit reached"
             if len(assistants) >= self.config["max_assistant_turns"]:
                 job["stop_reason"] = "Worker turn limit reached"
+            if self.get(task_id)["status"] == "cancelling":
+                job["status"] = "cancelling"
             if job.get("stop_reason") and job["status"] != "cancelling":
                 job["status"] = "cancelling"
                 self.save(job)
             if job["status"] == "cancelling":
+                if dispatch:
+                    await self.opencode.cancel_input(session, dispatch["id"])
                 await self.opencode.interrupt(session)
+                if dispatch:
+                    inbox = await self.opencode.inbox(session)
             active = (await self.opencode.request("GET", "/api/session/active"))["data"]
             if self.get(task_id)["status"] == "cancelling":
                 job["status"] = "cancelling"
             idle = info.get("time", {}).get("idle", 0) / 1000 >= job.get("submitted_at", float("inf"))
-            if session not in active and (idle or job["status"] == "cancelling"):
+            queued = dispatch and any(item.get("id") == dispatch["id"] for item in inbox)
+            if session not in active and not queued and (idle or job["status"] == "cancelling"):
                 job["summary"] = self.summary(run_assistants)
                 outcome = "cancelled" if job["status"] == "cancelling" else "completed"
                 if info.get("outcome") == "failed" or job.get("stop_reason"):
@@ -468,11 +505,11 @@ class Manager:
             ]:
                 job.pop(key, None)
             self.save(job)
-            await self.opencode.prompt(
-                job["session_id"],
+            await self.send_prompt(
+                task_id,
                 "Follow-up within the original allowed_paths and assignment constraints:\n" + instruction,
             )
-        return self.public(job)
+        return self.public(self.get(task_id))
 
     async def verify(self, task_id, request_id, checks):
         parsed = [Check.model_validate(check) for check in checks]
@@ -648,6 +685,7 @@ class Manager:
             "stop_reason",
             "feedback",
             "verification",
+            "dispatch",
             "cleaned_up",
         ]
         return {
@@ -660,6 +698,11 @@ class Manager:
     async def recover(self):
         for job in self.jobs():
             if job["status"] in ACTIVE:
+                if job.get("dispatch", {}).get("status") == "pending":
+                    job["dispatch"]["status"] = "uncertain"
+                    job["status"] = "cancelling"
+                    job["stop_reason"] = "Scheduler restarted before prompt admission was confirmed"
+                    self.save(job)
                 if job["status"] == "preparing":
                     path = self.state / "jobs" / job["id"] / "worktree"
                     if path.exists() and not job.get("workspace"):

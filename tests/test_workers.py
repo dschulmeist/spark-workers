@@ -402,7 +402,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 sent = []
 
                 class FakeOpenCode:
-                    async def prompt(self, session, text):
+                    async def prompt(self, session, text, message_id):
                         sent.append(text)
                         await asyncio.sleep(0.01)
 

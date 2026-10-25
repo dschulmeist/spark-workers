@@ -36,7 +36,7 @@ Reconnect clients after installation. The skill requests active delegation of su
 
 Start with an explicit base commit, goal, relevant files, allowed edit paths and acceptance criteria. Reuse the same request ID when retrying a start or follow-up. `worker_wait` waits for any/all selected tasks within a whole-call deadline and returns early for approvals. `worker_result` returns details; its optional `run` selects an archived result. Previous summaries, patches and evidence survive follow-ups. Patches are cumulative from the task input, and usage is session-cumulative, not a per-run delta.
 
-`worker_cancel` retains its slot until execution is confirmed stopped. Shell permissions are granted once by the coordinator; recursive delegation is denied.
+`worker_cancel` retains its slot until execution is confirmed stopped and queued input is removed. Uncertain prompt admission also retains the slot, including across restarts, until the recorded message ID is found in OpenCode. Shell permissions are granted once by the coordinator; recursive delegation is denied.
 
 With `include_working_tree=true`, the base must equal current HEAD. A temporary Git index snapshots tracked and non-ignored untracked files without changing the caller's index. Ignored dependencies/data are not copied; submodules are rejected. Worktrees isolate files, not networks or services. Approved shell commands are not sandboxed.
 

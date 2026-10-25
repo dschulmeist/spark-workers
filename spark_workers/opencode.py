@@ -37,8 +37,14 @@ class OpenCode:
         )
         return response["data"]
 
-    async def prompt(self, session, text):
-        return await self.request("POST", f"/api/session/{session}/prompt", {"text": text})
+    async def prompt(self, session, text, message_id):
+        return await self.request("POST", f"/api/session/{session}/prompt", {"id": message_id, "text": text})
+
+    async def inbox(self, session):
+        return (await self.request("GET", f"/api/session/{session}/inbox"))["data"]
+
+    async def cancel_input(self, session, message_id):
+        return await self.request("DELETE", f"/api/session/{session}/inbox/{message_id}")
 
     async def interrupt(self, session):
         return await self.request("POST", f"/api/session/{session}/interrupt", {})

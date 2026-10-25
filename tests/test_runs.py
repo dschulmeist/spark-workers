@@ -47,7 +47,7 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
                 manager.refresh = refresh
 
                 class FakeOpenCode:
-                    async def prompt(self, session, text):
+                    async def prompt(self, session, text, message_id):
                         pass
 
                 manager.opencode = FakeOpenCode()
