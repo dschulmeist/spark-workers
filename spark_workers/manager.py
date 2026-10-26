@@ -93,13 +93,18 @@ def assignment_prompt(job):
         "Stay in the provided worktree. Do not access the original checkout. "
         "Shell commands require coordinator approval. Never bypass a denied permission. "
         "Only edit allowed_paths (directory prefixes are allowed). An empty list means no edits. "
-        "For review or investigation tasks, use at most 8 assistant turns: batch related checks, keep outputs short, "
+        "For read-only tasks (empty allowed_paths), use at most 8 assistant turns: batch related checks, keep outputs short, "
         "inspect only relevant paths, and stop when the acceptance criteria are covered. If the requested scope "
         "does not fit, report what you checked and the remaining gaps instead of continuing broad scans. "
         "Report uncertainty instead of expanding scope. Do not commit. "
         "Finish in at most 500 words with a JSON object with summary, changes, tests (commands and outcomes), "
         "and open_points. Do not include full logs.\n\n" + json.dumps(task, ensure_ascii=False, indent=2)
     )
+
+
+def assistant_turn_limit(job, config):
+    configured_limit = config["max_assistant_turns"]
+    return min(configured_limit, 8) if not job.get("allowed_paths") else configured_limit
 
 
 class Manager:
@@ -414,7 +419,7 @@ class Manager:
                 job["stop_reason"] = "Unexpected model selected; no cloud fallback allowed"
             if time.time() - job["created_at"] > self.config["task_timeout_seconds"]:
                 job["stop_reason"] = "Worker time limit reached"
-            if len(assistants) >= self.config["max_assistant_turns"]:
+            if len(assistants) >= assistant_turn_limit(job, self.config):
                 job["stop_reason"] = "Worker turn limit reached"
             if self.get(task_id)["status"] == "cancelling":
                 job["status"] = "cancelling"
@@ -593,7 +598,7 @@ class Manager:
                     for message in await self.opencode.messages(job["session_id"])
                     if message.get("type") == "assistant"
                 ]
-                if len(assistants) >= self.config["max_assistant_turns"]:
+                if len(assistants) >= assistant_turn_limit(job, self.config):
                     raise ValueError("Original task turn limit is exhausted; start a new task")
                 backend = self.config["backends"][job["backend"]]
                 if any(
