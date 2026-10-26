@@ -93,6 +93,9 @@ def assignment_prompt(job):
         "Stay in the provided worktree. Do not access the original checkout. "
         "Shell commands require coordinator approval. Never bypass a denied permission. "
         "Only edit allowed_paths (directory prefixes are allowed). An empty list means no edits. "
+        "For review or investigation tasks, use at most 8 assistant turns: batch related checks, keep outputs short, "
+        "inspect only relevant paths, and stop when the acceptance criteria are covered. If the requested scope "
+        "does not fit, report what you checked and the remaining gaps instead of continuing broad scans. "
         "Report uncertainty instead of expanding scope. Do not commit. "
         "Finish in at most 500 words with a JSON object with summary, changes, tests (commands and outcomes), "
         "and open_points. Do not include full logs.\n\n" + json.dumps(task, ensure_ascii=False, indent=2)
