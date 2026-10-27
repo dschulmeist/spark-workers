@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -114,6 +114,21 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await self.manager.followup("task", "fix", "Review retained changes", reason)
         self.api.prompt.assert_not_awaited()
 
+    async def test_restart_before_followup_dispatch_does_not_reuse_old_admission(self):
+        with patch.object(self.manager, "send_prompt", new=AsyncMock(side_effect=RuntimeError("restart"))):
+            with self.assertRaisesRegex(RuntimeError, "restart"):
+                await self.manager.followup("task", "fix", "Review retained changes", "Cause addressed")
+        pending = self.manager.get("task")
+        self.assertEqual(pending["dispatch"]["status"], "pending")
+        self.assertNotEqual(pending["dispatch"]["id"], "msg_initial")
+
+        await self.manager.recover()
+        recovered = self.manager.get("task")
+        self.assertEqual(recovered["status"], "cancelling")
+        self.assertEqual(recovered["dispatch"]["status"], "uncertain")
+        self.api.prompt.assert_not_awaited()
+        self.assertEqual((await self.manager.result("task", 1))["status"], "failed")
+
     async def test_active_queued_or_uncertain_execution_blocks_failed_lifecycle(self):
         for condition in ["active", "queued", "uncertain"]:
             with self.subTest(condition=condition):
@@ -128,20 +143,35 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                     await self.manager.followup("task", "fix", "Review retained changes", "Cause addressed")
         self.api.prompt.assert_not_awaited()
 
-    async def test_failed_followup_preserves_original_time_and_turn_limits_and_model(self):
-        for condition in ["time", "turns", "model"]:
-            with self.subTest(condition=condition):
-                job = self.manager.get("task")
-                job["created_at"] = time.time() - (1300 if condition == "time" else 1)
-                self.manager.save(job)
-                assistant = {"type": "assistant", "model": {"providerID": "p", "id": "m"}}
-                self.api.messages.return_value = [assistant] * (24 if condition == "turns" else 1)
-                if condition == "model":
-                    assistant["model"]["id"] = "unexpected"
-                with self.assertRaises(ValueError):
-                    await self.manager.followup("task", "fix", "Review retained changes", "Cause addressed")
+    async def test_failed_followup_gets_a_fresh_budget_and_keeps_prior_failure(self):
+        job = self.manager.get("task")
+        job["created_at"] = time.time() - 1300
+        job["submitted_at"] = time.time() - 1300
+        job["stop_reason"] = "Worker turn limit reached"
+        job["turns_used"] = 24
+        job["turn_limit"] = 24
+        self.manager.save(job)
+        assistant = {"type": "assistant", "model": {"providerID": "p", "id": "m"}}
+        self.api.messages.return_value = [assistant] * 24
+
+        result = await self.manager.followup("task", "fix", "Summarize retained findings", "Budget exhausted")
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["run"], 2)
+        self.assertEqual(result["turns_used"], 0)
+        self.assertEqual(result["turn_limit"], CONFIG["max_assistant_turns"])
+        self.assertEqual(result["elapsed_seconds"], 0)
+        previous = await self.manager.result("task", 1)
+        self.assertEqual(previous["status"], "failed")
+        self.assertEqual(previous["stop_reason"], "Worker turn limit reached")
+        self.api.prompt.assert_awaited_once()
+
+    async def test_failed_followup_rejects_an_unexpected_session_model(self):
+        self.api.messages.return_value = [
+            {"type": "assistant", "model": {"providerID": "p", "id": "unexpected"}}
+        ]
+        with self.assertRaisesRegex(ValueError, "unexpected model"):
+            await self.manager.followup("task", "fix", "Review retained changes", "Cause addressed")
         self.api.prompt.assert_not_awaited()
-        self.assertFalse((self.directory.parent / "runs").exists())
 
     async def test_scope_violations_still_fail_independent_verification(self):
         (self.directory / "outside.txt").write_text("not permitted")

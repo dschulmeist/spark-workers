@@ -310,6 +310,41 @@ class ProtocolTests(unittest.TestCase):
 
 
 class OpenCodeContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_messages_follow_all_pages_in_order(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            if request.url.params.get("cursor") is None:
+                return httpx.Response(200, json={"data": [{"id": "first"}], "cursor": {"next": "page-2"}})
+            return httpx.Response(200, json={"data": [{"id": "last"}], "cursor": {"next": None}})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "service.json"
+            state.write_text(json.dumps({"url": "http://127.0.0.1:49374", "password": "test"}))
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                api = OpenCode(client)
+                api.state_path = state
+                messages = await api.messages("ses_test")
+
+        self.assertEqual([message["id"] for message in messages], ["first", "last"])
+        self.assertEqual(calls[0].url.params.get("order"), "asc")
+        self.assertEqual(calls[1].url.params.get("cursor"), "page-2")
+        self.assertIsNone(calls[1].url.params.get("order"))
+
+    async def test_messages_reject_a_repeated_cursor(self):
+        def handler(request):
+            return httpx.Response(200, json={"data": [], "cursor": {"next": "same-page"}})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "service.json"
+            state.write_text(json.dumps({"url": "http://127.0.0.1:49374", "password": "test"}))
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                api = OpenCode(client)
+                api.state_path = state
+                with self.assertRaisesRegex(ValueError, "repeated message cursor"):
+                    await api.messages("ses_test")
+
     async def test_v2_session_pins_model_and_credentials_are_reloaded(self):
         calls = []
 

@@ -53,10 +53,19 @@ class OpenCode:
         return (await self.request("GET", f"/api/session/{session}"))["data"]
 
     async def messages(self, session):
-        response = await self.request(
-            "GET", f"/api/session/{session}/message", params={"limit": "200", "order": "asc"}
-        )
-        return response["data"]
+        messages = []
+        params = {"limit": "200", "order": "asc"}
+        seen = set()
+        while True:
+            response = await self.request("GET", f"/api/session/{session}/message", params=params)
+            messages.extend(response["data"])
+            cursor = (response.get("cursor") or {}).get("next")
+            if not cursor:
+                return messages
+            if cursor in seen:
+                raise ValueError("OpenCode returned a repeated message cursor")
+            seen.add(cursor)
+            params = {"limit": "200", "cursor": cursor}
 
     async def permissions(self, session):
         return (await self.request("GET", f"/api/session/{session}/permission"))["data"]

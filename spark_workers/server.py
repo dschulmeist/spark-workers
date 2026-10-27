@@ -84,13 +84,13 @@ def tools():
         ),
         Tool(
             name="worker_result",
-            description="Get current progress or a recorded historical run: summary, verification and patch paths. Token usage is session-cumulative at that run. Full logs stay local.",
+            description="Get progress, per-run budget usage, evidence path, final summary and patch paths, or a recorded historical run. Token usage is session-cumulative. Full evidence stays local.",
             inputSchema=schema({"task_id": TASK_ID, "run": {"type": "integer", "minimum": 1}}, ["task_id"]),
             annotations=read_only,
         ),
         Tool(
             name="worker_wait",
-            description="Wait up to 30 seconds for any/all selected tasks. Returns early for command approvals. Prefer this to repeated status polling when no independent work remains.",
+            description="Wait up to 30 seconds for any/all selected tasks. Returns the latest checkpoint, activity and budget usage, and returns early for command approvals.",
             inputSchema=schema(
                 {
                     "task_ids": {
@@ -122,7 +122,7 @@ def tools():
         ),
         Tool(
             name="worker_followup",
-            description="Resume a completed worker, or a stopped failed worker with an explicit recovery_reason explaining the addressed cause. Original worktree, edit scope, model, capacity and total budgets still apply. Does not override denied permissions.",
+            description="Resume a completed worker, or a stopped failed worker with an explicit recovery_reason explaining the addressed cause. Original worktree, edit scope and model remain; each explicit follow-up gets fresh configured run budgets. Does not override denied permissions.",
             inputSchema=schema(
                 {
                     "task_id": TASK_ID,

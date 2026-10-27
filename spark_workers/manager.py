@@ -84,7 +84,15 @@ def capacity(backend, health, settings):
     return settings[backend]["capacity"]
 
 
-def assignment_prompt(job):
+def run_guidance(turn_limit):
+    return (
+        f"This run has a work budget of {turn_limit} assistant turns and one additional turn for the final JSON result. "
+        "Give brief progress checkpoints between batches without raw logs or secrets. "
+        "If the scope does not fit, report what you checked and the remaining gaps. "
+    )
+
+
+def assignment_prompt(job, turn_limit):
     task = {key: job[key] for key in ["goal", "relevant_files", "allowed_paths", "acceptance_criteria"]}
     return (
         "You are a delegated worker, not the coordinator. Work only on this bounded assignment. "
@@ -93,18 +101,32 @@ def assignment_prompt(job):
         "Stay in the provided worktree. Do not access the original checkout. "
         "Shell commands require coordinator approval. Never bypass a denied permission. "
         "Only edit allowed_paths (directory prefixes are allowed). An empty list means no edits. "
-        "For read-only tasks (empty allowed_paths), use at most 8 assistant turns: batch related checks, keep outputs short, "
-        "inspect only relevant paths, and stop when the acceptance criteria are covered. If the requested scope "
-        "does not fit, report what you checked and the remaining gaps instead of continuing broad scans. "
+        + run_guidance(turn_limit)
+        + "Keep outputs short and inspect only relevant paths. "
         "Report uncertainty instead of expanding scope. Do not commit. "
         "Finish in at most 500 words with a JSON object with summary, changes, tests (commands and outcomes), "
         "and open_points. Do not include full logs.\n\n" + json.dumps(task, ensure_ascii=False, indent=2)
     )
 
 
-def assistant_turn_limit(job, config):
-    configured_limit = config["max_assistant_turns"]
-    return min(configured_limit, 8) if not job.get("allowed_paths") else configured_limit
+def turn_limit_reached(assistants, limit):
+    return any(message.get("finish") in {"tool-calls", "tool_calls"} for message in assistants[limit:])
+
+
+def active_elapsed(job, now):
+    started = job.get("submitted_at")
+    if started is None:
+        started = job.get("created_at", now)
+    waiting = job.get("permission_wait_seconds", 0)
+    if job.get("permission_wait_started_at") is not None:
+        waiting += max(0, now - job["permission_wait_started_at"])
+    return max(0, now - started - waiting)
+
+
+def finish_permission_wait(job, now):
+    started = job.pop("permission_wait_started_at", None)
+    if started is not None:
+        job["permission_wait_seconds"] = job.get("permission_wait_seconds", 0) + max(0, now - started)
 
 
 class Manager:
@@ -230,6 +252,11 @@ class Manager:
                 "run": 1,
                 "created_at": time.time(),
                 "session_id": None,
+                "turns_used": 0,
+                "turn_limit": self.config["max_assistant_turns"],
+                "final_turn_grace": 1,
+                "elapsed_seconds": 0,
+                "time_limit_seconds": self.config["task_timeout_seconds"],
             }
             self.save(job)
             background = asyncio.create_task(self.prepare(job["id"]))
@@ -279,7 +306,7 @@ class Manager:
             job["submitted_at"] = time.time()
             job["status"] = "running"
             self.save(job)
-            await self.send_prompt(task_id, assignment_prompt(job))
+            await self.send_prompt(task_id, assignment_prompt(job, job["turn_limit"]))
         except Exception as error:
             LOG.exception("Worker preparation failed: %s", task_id)
             job = self.get(task_id)
@@ -304,10 +331,11 @@ class Manager:
                     }
                 await self.finalize(job, "failed")
 
-    async def send_prompt(self, task_id, text):
+    async def send_prompt(self, task_id, text, *, dispatch_prepared=False):
         job = self.get(task_id)
-        job["dispatch"] = {"id": "msg_" + uuid.uuid4().hex, "status": "pending"}
-        self.save(job)
+        if not dispatch_prepared:
+            job["dispatch"] = {"id": "msg_" + uuid.uuid4().hex, "status": "pending"}
+            self.save(job)
         try:
             await self.opencode.prompt(job["session_id"], text, job["dispatch"]["id"])
         except BaseException:
@@ -369,7 +397,19 @@ class Manager:
                     "tasks": [
                         {
                             key: job[key]
-                            for key in ["id", "backend", "status", "permission_requests"]
+                            for key in [
+                                "id",
+                                "backend",
+                                "status",
+                                "progress",
+                                "activity",
+                                "turns_used",
+                                "turn_limit",
+                                "final_turn_grace",
+                                "elapsed_seconds",
+                                "time_limit_seconds",
+                                "permission_requests",
+                            ]
                             if key in job
                         }
                         for job in jobs
@@ -399,30 +439,84 @@ class Manager:
                 job["status"] = self.get(task_id)["status"]
                 self.save(job)
             artifact = self.state / "jobs" / task_id
-            (artifact / "opencode.json").write_text(
+            evidence = artifact / "opencode.json"
+            temporary = artifact / "opencode.json.tmp"
+            temporary.write_text(
                 json.dumps({"session": info, "messages": messages}, ensure_ascii=False, indent=2)
             )
+            temporary.replace(evidence)
+            job["evidence"] = str(evidence)
             assistants = [m for m in messages if m.get("type") == "assistant"]
             run_assistants = [
                 m
                 for m in assistants
                 if m.get("time", {}).get("created", 0) >= job.get("submitted_at", 0) * 1000
             ]
+            progress = self.summary(run_assistants)
+            if progress:
+                job["progress"] = progress[:1200]
+            for message in reversed(run_assistants):
+                tools = [part for part in message.get("content", []) if part.get("type") == "tool"]
+                if tools:
+                    tool = tools[-1]
+                    job["activity"] = {
+                        "tool": tool.get("name", "unknown"),
+                        "status": tool.get("state", {}).get("status", "unknown"),
+                    }
+                    break
             job["tokens"] = info.get("tokens")
             job["cost_reported_by_opencode"] = info.get("cost")
+            job.setdefault("turn_limit", self.config["max_assistant_turns"])
+            job.setdefault("final_turn_grace", 1)
+            job.setdefault("time_limit_seconds", self.config["task_timeout_seconds"])
+            job["turns_used"] = len(run_assistants)
+            active = (await self.opencode.request("GET", "/api/session/active"))["data"]
+            idle_at = info.get("time", {}).get("idle", 0) / 1000
+            idle = idle_at >= job.get("submitted_at", float("inf"))
+            queued = dispatch and any(item.get("id") == dispatch["id"] for item in inbox)
+            failed_response = bool(
+                run_assistants
+                and run_assistants[-1].get("finish") == "error"
+                and run_assistants[-1].get("error")
+                and run_assistants[-1].get("time", {}).get("completed", 0) / 1000
+                >= job.get("submitted_at", float("inf"))
+            )
+            finished_at = None
+            if session not in active and not queued:
+                if idle:
+                    finished_at = idle_at
+                elif run_assistants and run_assistants[-1].get("finish") == "error":
+                    completed = run_assistants[-1].get("time", {}).get("completed", 0) / 1000
+                    if completed >= job.get("submitted_at", float("inf")):
+                        finished_at = completed
+            now = time.time()
+            terminal = session not in active and not queued and (idle or failed_response)
+            requests = (
+                [] if terminal or job["status"] == "cancelling" else await self.opencode.permissions(session)
+            )
+            if requests:
+                job.setdefault("permission_wait_started_at", now)
+            budget_time = min(now, finished_at) if finished_at is not None else now
+            job["elapsed_seconds"] = round(active_elapsed(job, budget_time), 2)
             expected = self.config["backends"][job["backend"]]
-            if any(
-                m.get("model", {}).get("providerID") != expected["provider"]
-                or m.get("model", {}).get("id") != expected["model"]
-                for m in assistants
-            ):
-                job["stop_reason"] = "Unexpected model selected; no cloud fallback allowed"
-            if time.time() - job["created_at"] > self.config["task_timeout_seconds"]:
-                job["stop_reason"] = "Worker time limit reached"
-            if len(assistants) >= assistant_turn_limit(job, self.config):
-                job["stop_reason"] = "Worker turn limit reached"
-            if self.get(task_id)["status"] == "cancelling":
+            current = self.get(task_id)
+            if current["status"] == "cancelling":
                 job["status"] = "cancelling"
+                if current.get("cancel_requested") or not current.get("stop_reason"):
+                    job["cancel_requested"] = True
+                if current.get("stop_reason"):
+                    job["stop_reason"] = current["stop_reason"]
+            else:
+                if any(
+                    m.get("model", {}).get("providerID") != expected["provider"]
+                    or m.get("model", {}).get("id") != expected["model"]
+                    for m in assistants
+                ):
+                    job["stop_reason"] = "Unexpected model selected; no cloud fallback allowed"
+                if not requests and job["elapsed_seconds"] > job["time_limit_seconds"]:
+                    job["stop_reason"] = "Worker time limit reached"
+                if turn_limit_reached(run_assistants, job["turn_limit"]):
+                    job["stop_reason"] = "Worker turn limit reached"
             if job.get("stop_reason") and job["status"] != "cancelling":
                 job["status"] = "cancelling"
                 self.save(job)
@@ -432,18 +526,15 @@ class Manager:
                 await self.opencode.interrupt(session)
                 if dispatch:
                     inbox = await self.opencode.inbox(session)
-            active = (await self.opencode.request("GET", "/api/session/active"))["data"]
-            if self.get(task_id)["status"] == "cancelling":
+                active = (await self.opencode.request("GET", "/api/session/active"))["data"]
+            current = self.get(task_id)
+            if current["status"] == "cancelling":
                 job["status"] = "cancelling"
-            idle = info.get("time", {}).get("idle", 0) / 1000 >= job.get("submitted_at", float("inf"))
+                if current.get("cancel_requested"):
+                    job["cancel_requested"] = True
+                if current.get("stop_reason"):
+                    job["stop_reason"] = current["stop_reason"]
             queued = dispatch and any(item.get("id") == dispatch["id"] for item in inbox)
-            failed_response = bool(
-                run_assistants
-                and run_assistants[-1].get("finish") == "error"
-                and run_assistants[-1].get("error")
-                and run_assistants[-1].get("time", {}).get("completed", 0) / 1000
-                >= job.get("submitted_at", float("inf"))
-            )
             if (
                 session not in active
                 and not queued
@@ -451,7 +542,8 @@ class Manager:
             ):
                 job["summary"] = self.summary(run_assistants)
                 response_error = run_assistants[-1].get("error") if run_assistants else None
-                if response_error:
+                manual_cancel = job.get("cancel_requested") and not job.get("stop_reason")
+                if response_error and not manual_cancel:
                     job["opencode_error"] = {
                         "type": response_error["type"][:100],
                         "message": response_error["message"][:1200],
@@ -463,7 +555,7 @@ class Manager:
                     }
                     job["error"] = job["opencode_error"]["message"]
                 outcome = "cancelled" if job["status"] == "cancelling" else "completed"
-                if info.get("outcome") == "failed" or job.get("stop_reason"):
+                if not manual_cancel and (info.get("outcome") == "failed" or job.get("stop_reason")):
                     outcome = "failed"
                 if outcome == "completed" and (
                     not run_assistants
@@ -476,7 +568,6 @@ class Manager:
                     job["error"] = job["stop_reason"]
                 await self.finalize(job, outcome)
             else:
-                requests = await self.opencode.permissions(session)
                 tool_inputs = {
                     part["id"]: part.get("state", {}).get("input")
                     for message in assistants
@@ -486,11 +577,21 @@ class Manager:
                 for request in requests:
                     request["tool_input"] = tool_inputs.get(request.get("source", {}).get("id"))
                 job["permission_requests"] = requests
-                job["status"] = (
-                    "cancelling"
-                    if self.get(task_id)["status"] == "cancelling"
-                    else ("waiting_permission" if requests else "running")
-                )
+                current = self.get(task_id)
+                if current["status"] == "cancelling":
+                    job["status"] = "cancelling"
+                    if current.get("cancel_requested"):
+                        job["cancel_requested"] = True
+                    if current.get("stop_reason"):
+                        job["stop_reason"] = current["stop_reason"]
+                else:
+                    job["status"] = "waiting_permission" if requests else "running"
+                now = time.time()
+                if requests and job["status"] != "cancelling":
+                    job.setdefault("permission_wait_started_at", now)
+                else:
+                    finish_permission_wait(job, now)
+                job["elapsed_seconds"] = round(active_elapsed(job, now), 2)
                 self.save(job)
         except (httpx.HTTPError, OSError, ValueError, KeyError) as error:
             current = self.get(task_id)
@@ -530,6 +631,8 @@ class Manager:
         job = self.get(task_id)
         if job["status"] not in ACTIVE:
             return self.public(job)
+        if not job.get("stop_reason"):
+            job["cancel_requested"] = True
         job["status"] = "cancelling"
         self.save(job)
         if job["session_id"]:
@@ -538,10 +641,24 @@ class Manager:
         return self.public(self.get(task_id))
 
     async def reply(self, task_id, request_id, approve):
-        job = await self.refresh(task_id)
-        if request_id not in {r["id"] for r in job.get("permission_requests", [])}:
-            raise ValueError("Permission is not pending for this task")
-        await self.opencode.permission_reply(job["session_id"], request_id, approve)
+        async with self.refresh_locks.setdefault(task_id, asyncio.Lock()):
+            job = await self._refresh(task_id)
+            if request_id not in {r["id"] for r in job.get("permission_requests", [])}:
+                raise ValueError("Permission is not pending for this task")
+            await self.opencode.permission_reply(job["session_id"], request_id, approve)
+            current = self.get(task_id)
+            if current["status"] == "waiting_permission":
+                current["permission_requests"] = [
+                    request
+                    for request in current.get("permission_requests", [])
+                    if request["id"] != request_id
+                ]
+                if not current["permission_requests"]:
+                    now = time.time()
+                    finish_permission_wait(current, now)
+                    current["elapsed_seconds"] = round(active_elapsed(current, now), 2)
+                    current["status"] = "running"
+                self.save(current)
         return {"task_id": task_id, "approved_once": approve}
 
     def retained_worktree(self, job):
@@ -591,15 +708,11 @@ class Manager:
                 if job.get("dispatch", {}).get("status") != "accepted":
                     raise ValueError("Failed task has no confirmed prompt admission; start a new task")
                 await self.confirm_stopped(job)
-                if time.time() - job["created_at"] >= self.config["task_timeout_seconds"]:
-                    raise ValueError("Original task time limit is exhausted; start a new task")
                 assistants = [
                     message
                     for message in await self.opencode.messages(job["session_id"])
                     if message.get("type") == "assistant"
                 ]
-                if len(assistants) >= assistant_turn_limit(job, self.config):
-                    raise ValueError("Original task turn limit is exhausted; start a new task")
                 backend = self.config["backends"][job["backend"]]
                 if any(
                     message.get("model", {}).get("providerID") != backend["provider"]
@@ -617,6 +730,11 @@ class Manager:
             job["run"] = job.get("run", 1) + 1
             job["status"] = "running"
             job["submitted_at"] = time.time()
+            job["turns_used"] = 0
+            job["turn_limit"] = self.config["max_assistant_turns"]
+            job["final_turn_grace"] = 1
+            job["elapsed_seconds"] = 0
+            job["time_limit_seconds"] = self.config["task_timeout_seconds"]
             job.setdefault("followups", []).append(
                 {"request_id": request_id, "instruction": instruction, "recovery_reason": recovery_reason}
             )
@@ -625,6 +743,9 @@ class Manager:
             job.pop("verification", None)
             for key in [
                 "summary",
+                "progress",
+                "activity",
+                "evidence",
                 "artifacts",
                 "duration_seconds",
                 "permission_requests",
@@ -632,14 +753,21 @@ class Manager:
                 "opencode_error",
                 "connection_error",
                 "stop_reason",
+                "cancel_requested",
+                "permission_wait_started_at",
+                "permission_wait_seconds",
             ]:
                 job.pop(key, None)
+            job["dispatch"] = {"id": "msg_" + uuid.uuid4().hex, "status": "pending"}
             self.save(job)
             await self.send_prompt(
                 task_id,
                 "Follow-up within the original allowed_paths and assignment constraints:\n"
                 + instruction
-                + ("\nRecovery reason: " + recovery_reason if recovery_reason else ""),
+                + ("\nRecovery reason: " + recovery_reason if recovery_reason else "")
+                + "\n"
+                + run_guidance(job["turn_limit"]),
+                dispatch_prepared=True,
             )
         return self.public(self.get(task_id))
 
@@ -810,6 +938,14 @@ class Manager:
             "workspace",
             "artifacts",
             "summary",
+            "progress",
+            "activity",
+            "evidence",
+            "turns_used",
+            "turn_limit",
+            "final_turn_grace",
+            "elapsed_seconds",
+            "time_limit_seconds",
             "tokens",
             "permission_requests",
             "error",
@@ -821,12 +957,16 @@ class Manager:
             "dispatch",
             "cleaned_up",
         ]
-        return {
+        result = {
             "run": job.get("run", 1),
             "usage_scope": "session_cumulative",
             "patch_scope": "task_input_snapshot",
             **{key: job[key] for key in keys if key in job},
         }
+        evidence = self.state / "jobs" / job["id"] / "opencode.json"
+        if job["status"] in TERMINAL and "evidence" not in result and evidence.is_file():
+            result["evidence"] = str(evidence)
+        return result
 
     async def recover(self):
         for job in self.jobs():

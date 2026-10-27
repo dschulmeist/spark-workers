@@ -112,11 +112,13 @@ Replace the paths with files in your repository. The coordinator checks `workers
 | `workers_list` / `workers_metrics` | Find stored tasks and inspect recorded usage and outcomes. |
 | `worker_cancel` | Stop a task while retaining partial changes and evidence. |
 
-Reuse a request ID when retrying the same start or follow-up; use a new ID for a new request. `worker_wait` supports any/all waits of up to 30 seconds and returns early for approvals. `workers_list` supports status, repository, and creation-time filters with pagination.
+Reuse a request ID when retrying the same start or follow-up; use a new ID for a new request. `worker_wait` supports any/all waits of up to 30 seconds and returns early for approvals. `worker_wait` and `worker_result` report the latest checkpoint, tool activity, and configured turn and time budgets. Each run has one additional assistant turn for a final response. If the scheduler observes tool use beyond the turn budget, it interrupts the session; polling means that tool may already have started. Time spent waiting for command approval does not count against the run's time budget. `workers_list` supports status, repository, and creation-time filters with pagination.
 
 Completion means the worker has finished, not that its patch has passed independent checks or review. `worker_verify` runs up to three approved command argument lists with a shared 30-second budget, without a shell or model. Longer checks belong in the coordinating agent. Failed checks block acceptance. Integrate patches one at a time, record feedback, then clean up. Cleanup refuses changes made after the last export.
 
-Follow-ups preserve earlier summaries, patches, and evidence; `worker_result` can select a historical `run`. Patches remain cumulative from the original task input, and token usage is cumulative within the session. A stopped failed task can be continued with an explicit `recovery_reason`; its previous failure remains archived. Recovery preserves the original scope, model, and total budgets and cannot override denied permissions.
+Follow-ups preserve earlier summaries, patches, and evidence; `worker_result` can select a historical `run`. Patches remain cumulative from the original task input, and token usage is cumulative within the session. A stopped failed task can be continued with an explicit `recovery_reason`; its previous failure remains archived. Each explicit follow-up gets a fresh configured run budget while preserving the original scope and model. Recovery cannot override denied permissions.
+
+If a budget stops a task before its final answer, inspect its `progress` and local `evidence` path. Keep the worktree until a follow-up has summarized or continued the work, or the result is rejected.
 
 ## The boundaries
 
@@ -141,6 +143,14 @@ uv run python -u tests/smoke.py --backend primary
 ```
 
 The smoke test creates a temporary repository, requests a real model edit, approves a bounded test command, checks the resulting patch, and cleans up its worktree. It uses inference on the selected backend.
+
+To verify that OpenCode denies a worker session's `worker_permission` MCP action, start the OpenCode service and run:
+
+```sh
+uv run python -u tests/check_worker_mcp_permissions.py
+```
+
+This check creates and deletes a temporary OpenCode session, makes no model request, and does not call the MCP tool. An explicit allow rule acts as a positive control so an unrecognized or misspelled action name cannot pass merely because of the default deny rule.
 
 ## License
 

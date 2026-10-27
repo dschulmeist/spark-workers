@@ -8,7 +8,14 @@ from pathlib import Path
 import httpx
 
 from spark_workers import workspace
-from spark_workers.manager import Assignment, BackendHealth, Manager, capacity
+from spark_workers.manager import (
+    Assignment,
+    BackendHealth,
+    Manager,
+    active_elapsed,
+    capacity,
+    turn_limit_reached,
+)
 from spark_workers.server import tools
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,6 +25,17 @@ CONFIG["backends"]["david"]["expand_when_unavailable"] = "denis"
 
 
 class CapacityTests(unittest.TestCase):
+    def test_turn_limit_allows_final_response_at_boundary(self):
+        self.assertFalse(turn_limit_reached([{"finish": "tool-calls"}] * 24, 24))
+        self.assertFalse(turn_limit_reached([{"finish": "tool-calls"}] * 24 + [{"finish": None}], 24))
+        self.assertFalse(turn_limit_reached([{"finish": "tool-calls"}] * 24 + [{"finish": "stop"}], 24))
+        self.assertTrue(turn_limit_reached([{"finish": "tool-calls"}] * 25, 24))
+        self.assertTrue(turn_limit_reached([{"finish": "tool-calls"}] * 25 + [{"finish": "stop"}], 24))
+
+    def test_active_time_excludes_completed_and_current_permission_wait(self):
+        job = {"submitted_at": 100, "permission_wait_seconds": 20, "permission_wait_started_at": 160}
+        self.assertEqual(active_elapsed(job, 200), 40)
+
     def test_capacity_switch_and_unavailable(self):
         health = {k: BackendHealth(v) for k, v in CONFIG["backends"].items()}
         self.assertEqual(capacity("david", health, CONFIG["backends"]), 0)
@@ -99,6 +117,18 @@ class WorkspaceTests(unittest.TestCase):
         workspace.git(self.repo, "add", "a.py")
         workspace.git(self.repo, "commit", "-qm", "Initial")
         self.base = workspace.git(self.repo, "rev-parse", "HEAD").decode().strip()
+
+    def test_worker_permissions_deny_unlisted_actions(self):
+        self.assertEqual(
+            workspace.permissions(self.root / "worktree", []),
+            [
+                {"action": "*", "resource": "*", "effect": "deny"},
+                {"action": "read", "resource": "*", "effect": "allow"},
+                {"action": "glob", "resource": "*", "effect": "allow"},
+                {"action": "grep", "resource": "*", "effect": "allow"},
+                {"action": "shell", "resource": "*", "effect": "ask"},
+            ],
+        )
 
     def tearDown(self):
         self.temporary.cleanup()

@@ -57,6 +57,7 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(manager.get("abc")["run"], 2)
                 self.assertNotIn("summary", manager.get("abc"))
                 self.assertNotIn("artifacts", manager.get("abc"))
+                self.assertNotIn("evidence", manager.public(manager.get("abc")))
                 patch.write_text("second patch")
                 (folder / "opencode.json").write_text("second evidence")
                 previous = await manager.result("abc", 1)
@@ -66,6 +67,20 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(previous["tokens"]["input"], 100)
                 self.assertEqual(previous["usage_scope"], "session_cumulative")
                 self.assertTrue(previous["historical"])
+                manager.db.close()
+
+    async def test_existing_terminal_task_exposes_retained_evidence_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            async with httpx.AsyncClient() as client:
+                manager = Manager(root, CONFIG, client)
+                folder = manager.state / "jobs/abc"
+                folder.mkdir(parents=True)
+                evidence = folder / "opencode.json"
+                evidence.write_text("retained evidence")
+                manager.save({"id": "abc", "request_id": "old", "backend": "primary", "status": "failed"})
+                result = await manager.result("abc")
+                self.assertEqual(result["evidence"], str(evidence))
+                self.assertNotIn("retained evidence", str(result))
                 manager.db.close()
 
     async def test_old_assistant_response_cannot_complete_a_new_run(self):
